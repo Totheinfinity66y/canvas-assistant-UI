@@ -1,0 +1,13 @@
+{
+  "canvas_token": "YOUR_CANVAS_API_TOKEN",
+  "base_url": "https://oc.sjtu.edu.cn",
+  "manager": {
+    "semester": "2027 春季",
+    "labels": {"app_title": "我的学习资料", "assignments_title": "作业进度", "files_title": "课程资料"},
+    "layout": {"slides": "slides", "homework": "homework", "project": "project", "reference": "reference", "attachments": "attachments", "code": "code", "week_prefix": "Week_", "date_assignments": true},
+    "course_map": {},
+    "course_ids": [],
+    "max_mb": 150,
+    "include_media": false
+  }
+}

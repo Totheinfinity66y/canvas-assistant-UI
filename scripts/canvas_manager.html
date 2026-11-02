@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Canvas 资料与作业</title>
+<style>
+:root{font-family:Segoe UI,Microsoft YaHei,sans-serif;color:#172a3b;background:#f3f6fa}*{box-sizing:border-box}body{margin:0}main{max-width:1440px;margin:auto;padding:32px}header{display:flex;align-items:center;justify-content:space-between;gap:20px}h1{font-size:28px;margin:0 0 8px}p{color:#5b6e80;margin:4px 0 20px}button,input,select{font:inherit;border-radius:8px;border:1px solid #c8d4de;padding:10px 14px;background:white}button{cursor:pointer;color:#213e55}button.primary{background:#126c65;color:white;border:0}button:disabled{opacity:.5;cursor:default}.toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:20px 0}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-top:24px}.card,.task{background:#fff;border:1px solid #dde5ec;border-radius:12px;padding:18px}.card b{display:block;font-size:28px;margin-top:8px}.card span{color:#617182}.task{margin:20px 0}.task-top{display:flex;justify-content:space-between;gap:12px}progress{width:100%;height:14px;margin-top:12px;accent-color:#168377}#byteProgress{height:8px}#bytes,#taskDetail{color:#617182;font-size:13px}.list{background:white;border:1px solid #dde5ec;border-radius:12px;overflow:auto}table{width:100%;border-collapse:collapse;min-width:850px;text-align:left}th{background:#edf3f7;color:#516778;font-weight:600}td,th{padding:14px 12px;border-bottom:1px solid #edf1f4}td small{display:block;color:#647687;margin-top:5px;max-width:560px;word-break:break-all}input[type=checkbox]{width:18px;height:18px;accent-color:#126c65}input[type=search]{min-width:230px;flex:1}.badge{display:inline-block;border-radius:20px;padding:4px 9px;font-size:12px;background:#e9f1f7;white-space:nowrap}.exists{background:#e1f3ec;color:#246e4c}.pending{background:#fff1d6;color:#846016}.skipped,.failed{background:#f9e8e8;color:#9a4444}#errors,#results{white-space:pre-wrap;line-height:1.7;font-size:13px}.error{color:#a33131}#empty{padding:50px;text-align:center;color:#6c7e8c}label{display:inline-flex;gap:6px;align-items:center}footer{color:#6c7e8c;font-size:12px;margin:18px 0}@media(max-width:700px){main{padding:16px}header{align-items:flex-start;flex-direction:column}.stats{grid-template-columns:repeat(2,1fr)}h1{font-size:24px}}
+</style>
+<main>
+<nav style="display:flex;gap:24px;margin-bottom:28px"><strong id="appTitle">Canvas 学习助手</strong><a id="assignmentsNav" href="/assignments">作业进度</a><a id="filesNav" href="/files" aria-current="page">资料下载</a><a href="/setup">账号与学期设置</a></nav>
+<header><div><h1 id="pageTitle">资料下载</h1><p id="semester">按课程归档 · 自选下载 · 递归检查本地文件</p></div><button id="scan" class="primary">扫描 Canvas</button></header>
+<div class="stats"><div class="card"><span>已扫描课程</span><b id="courses">—</b></div><div class="card"><span>待下载项目</span><b id="pending">—</b></div><div class="card"><span>本地已存在</span><b id="exists">—</b></div><div class="card"><span>待交 / 逾期作业</span><b id="due">—</b></div></div>
+<section class="task" aria-live="polite"><div class="task-top"><strong id="message">点击扫描读取 Canvas</strong><span id="count"></span></div><progress id="progress" max="1" value="0"></progress><div id="taskDetail"></div><progress id="byteProgress" max="1" value="0" hidden></progress><div id="bytes"></div><div id="errors" class="error"></div></section>
+<div class="toolbar"><select id="course" aria-label="课程筛选"><option value="">全部课程</option></select><select id="kind" aria-label="类型筛选"><option value="">全部类型</option><option value="file">课程文件</option><option value="assignment">作业说明</option><option value="attachment">作业附件</option></select><select id="status" aria-label="状态筛选"><option value="">全部下载状态</option><option value="pending">待下载</option><option value="exists">本地已有</option><option value="skipped">已跳过</option></select><input type="search" id="search" placeholder="搜索课程、文件或作业" aria-label="搜索"><button id="choose">选择当前待下载项</button><button id="clear">清空选择</button><button id="download" class="primary" disabled>下载所选 (0)</button></div>
+<div class="list"><table><thead><tr><th><input type="checkbox" id="all" aria-label="全选当前待下载项"></th><th>课程 / 类型</th><th>文件或作业 / 保存位置</th><th>下载状态</th><th>作业提交进度</th></tr></thead><tbody id="rows"></tbody></table><div id="empty">扫描后显示所有可访问的课程文件与作业。扫描不会写入资料库。</div></div>
+<section class="task" id="resultBox" hidden><strong>本次下载结果</strong><div id="results"></div></section>
+<footer>时间统一为上海时间（UTC+8）。作业提交进度来自 Canvas；实际提交请在 Canvas 页面操作。已有作业快照保留，最新状态以本页面扫描结果为准。默认跳过音视频及超过 150 MB 的文件，可通过启动参数调整。</footer>
+</main>
+<script>
+const csrf='__CSRF__', $=id=>document.getElementById(id), chosen=new Set();
+let items=[], busy=false, fingerprint='', scanTime='', lastResults='';
+const labels={file:'课程文件',assignment:'作业说明',attachment:'作业附件',pending:'待下载',exists:'本地已有',skipped:'已跳过',downloaded:'已下载',failed:'失败'};
+function size(n){return n>=1048576?(n/1048576).toFixed(1)+' MB':n>=1024?(n/1024).toFixed(1)+' KB':n+' B'}
+function node(tag,text,cls){let el=document.createElement(tag);el.textContent=text;if(cls)el.className=cls;return el}
+function filtered(){let q=$('search').value.toLowerCase();return items.filter(i=>(!$('course').value||String(i.course_id)===$('course').value)&&(!$('kind').value||i.kind===$('kind').value)&&(!$('status').value||i.status===$('status').value)&&(!q||(i.name+' '+i.course).toLowerCase().includes(q)))}
+function controls(){document.querySelectorAll('button').forEach(b=>b.disabled=busy);$('download').disabled=busy||!chosen.size;$('download').textContent=`下载所选 (${chosen.size})`;$('all').disabled=busy;document.querySelectorAll('#rows input').forEach(e=>e.disabled=busy);}
+function render(){
+ const rows=$('rows');rows.replaceChildren();let visible=filtered();
+ for(const i of visible){let row=document.createElement('tr'),c=document.createElement('td');
+ if(i.status==='pending'){let box=document.createElement('input');box.type='checkbox';box.checked=chosen.has(i.key);box.setAttribute('aria-label','选择 '+i.name);box.onchange=()=>{box.checked?chosen.add(i.key):chosen.delete(i.key);controls()};c.append(box)} row.append(c);
+ c=node('td',i.course);c.append(node('small',labels[i.kind]));row.append(c);
+ c=node('td',i.name);c.append(node('small',i.path));if(i.size)c.append(node('small',size(i.size)));row.append(c);
+ c=document.createElement('td');c.append(node('span',labels[i.status]||i.status,'badge '+i.status));if(i.reason)c.append(node('small',i.reason));row.append(c);
+ c=node('td',i.submission||'—');if(i.due_local)c.append(node('small','截止 '+i.due_local));if(i.canvas_url){let link=node('a','在 Canvas 查看 / 提交');link.href=i.canvas_url;link.target='_blank';link.rel='noopener noreferrer';let wrap=document.createElement('small');wrap.append(link);c.append(wrap)}row.append(c);rows.append(row);
+ }
+ $('empty').hidden=visible.length>0;$('empty').textContent=items.length?'当前筛选没有匹配项目':'扫描后显示所有可访问的课程文件与作业。扫描不会写入资料库。';
+ const selectable=visible.filter(i=>i.status==='pending');$('all').checked=selectable.length>0&&selectable.every(i=>chosen.has(i.key));controls();
+}
+function choose(){for(const i of filtered())if(i.status==='pending')chosen.add(i.key);render()}
+$('choose').onclick=choose;$('all').onchange=()=>{if($('all').checked)choose();else{for(const i of filtered())chosen.delete(i.key);render()}};
+$('clear').onclick=()=>{chosen.clear();render()};for(const id of ['course','kind','status','search'])$(id).addEventListener('input',render);
+async function action(path,body={}){try{let r=await fetch('/api/'+path,{method:'POST',headers:{'Content-Type':'application/json','X-Canvas-CSRF':csrf},body:JSON.stringify(body)});let data=await r.json();if(!r.ok)throw Error(data.error);busy=true;controls();await poll()}catch(e){$('message').textContent=e.message}}
+$('scan').onclick=()=>action('scan');$('download').onclick=()=>action('download',{keys:[...chosen]});
+async function poll(){try{
+ let r=await fetch('/api/state');if(!r.ok)throw Error('读取任务状态失败');let data=await r.json(),s=data.state,inv=data.inventory;busy=s.busy;
+ const preferences=data.preferences||{},settings=preferences.settings||{},labels=settings.labels||{};for(const [id,key] of [['appTitle','app_title'],['assignmentsNav','assignments_title'],['filesNav','files_title'],['pageTitle','files_title']])if(labels[key])$(id).textContent=labels[key];document.title=$('pageTitle').textContent;if(settings.semester)$('semester').textContent=settings.semester+' · 按课程归档 · 自选下载';
+ $('message').textContent=s.message;$('count').textContent=s.total?`${s.current} / ${s.total}`:'';$('progress').max=s.total||1;$('progress').value=s.current||0;
+ $('taskDetail').textContent=busy?(s.stage==='scan'?'正在逐课程读取文件与作业…':'正在保存所选项目…'):(scanTime?'上次扫描：'+scanTime:'');
+ $('byteProgress').hidden=!(s.stage==='download'&&s.size&&busy);$('byteProgress').max=s.size||1;$('byteProgress').value=s.bytes||0;$('bytes').textContent=s.stage==='download'&&s.size&&busy?`${size(s.bytes||0)} / ${size(s.size)}`:'';
+ $('errors').textContent=(inv.errors||[]).map(e=>`课程 ${e.course_id||''} ${e.section||''}：${e.error}`).join('\n');
+ let fp=JSON.stringify(inv);if(fp!==fingerprint){fingerprint=fp;items=inv.items||[];scanTime=inv.scanned_at?new Date(inv.scanned_at).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'}):'';const pending=new Set(items.filter(i=>i.status==='pending').map(i=>i.key));for(const k of chosen)if(!pending.has(k))chosen.delete(k);
+ let current=$('course').value;$('course').replaceChildren(new Option('全部课程',''));let courses=new Map(items.map(i=>[String(i.course_id),i.course]));for(const [id,name]of courses)$('course').add(new Option(name,id));$('course').value=courses.has(current)?current:'';
+ $('courses').textContent=inv.courses??'—';for(const status of ['pending','exists'])$(status).textContent=items.filter(i=>i.status===status).length;$('due').textContent=items.filter(i=>i.kind==='assignment'&&['待提交','逾期未交'].includes(i.submission)).length;render();}
+ let rs=JSON.stringify(s.results||[]);if(rs!==lastResults){lastResults=rs;$('results').textContent=(s.results||[]).map(i=>`${labels[i.status]||i.status} · ${i.name}\n${i.path}${i.reason?' · '+i.reason:''}`).join('\n\n');$('resultBox').hidden=!(s.results||[]).length}controls();
+ }catch(e){$('message').textContent='本地服务连接中断：'+e.message}}
+poll();setInterval(poll,800);
+</script>
+</html>
