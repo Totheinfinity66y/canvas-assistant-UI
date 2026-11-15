@@ -5,6 +5,7 @@ No submission/upload endpoint is exposed. Requires only requests + Python 3.11.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 from html.parser import HTMLParser
 import json
@@ -34,6 +35,66 @@ MEDIA = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.mp3', '.wav', '.m4a', '.flv'
 
 class ManagerError(Exception):
     pass
+
+
+class DownloadLock:
+    """Kernel-held mutex plus a replaceable diagnostic marker.
+
+    Never remove the guard file: recreating it could let two processes lock
+    different inodes. A crashed process loses its OS lock automatically.
+    """
+    def __init__(self, marker):
+        self.marker = Path(marker)
+        self.guard = self.marker.with_suffix('.guard')
+        self.fd = None
+        self.owner = secrets.token_hex(16)
+
+    def __enter__(self):
+        self.marker.parent.mkdir(parents=True, exist_ok=True)
+        if self.guard.is_symlink():
+            raise ManagerError('下载锁路径异常，请检查资料库目录')
+        self.fd = os.open(self.guard, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    msvcrt.locking(self.fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise ManagerError('另一个下载任务正在运行，请等待该任务完成后再试；当前任务未启动') from None
+                raise ManagerError('无法获取系统下载锁，请检查资料库文件系统和写入权限') from None
+            # Owning the guard proves that any old marker is orphaned. This also
+            # recovers empty markers left by v2.1.0 after all old apps are closed.
+            fd, tmp = tempfile.mkstemp(prefix='.download-', suffix='.tmp', dir=self.marker.parent)
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                    json.dump(dict(pid=os.getpid(), owner=self.owner, started_at=datetime.now(CST).isoformat()), stream)
+                os.replace(tmp, self.marker)
+            finally:
+                Path(tmp).unlink(missing_ok=True)
+            return self
+        except BaseException:
+            os.close(self.fd)
+            self.fd = None
+            raise
+
+    def __exit__(self, *exc_info):
+        try:
+            try:
+                metadata = json.loads(self.marker.read_text(encoding='utf-8'))
+                if isinstance(metadata, dict) and metadata.get('owner') == self.owner:
+                    self.marker.unlink(missing_ok=True)
+            except (OSError, ValueError):
+                # A marker is diagnostic only. Even if cleanup fails, the guard
+                # is released and the next job can recover the orphaned marker.
+                pass
+        finally:
+            if self.fd is not None:
+                os.close(self.fd)
+                self.fd = None
 
 
 def safe_name(value):
@@ -222,10 +283,16 @@ class Manager:
         indexed = self.index.get(item['identity'])
         if indexed and indexed.get('updated_at') == item.get('updated_at') and indexed.get('size') == item.get('size'):
             path = self.inside(self.root / indexed['path'])
+            if item['kind'] == 'attachment' and not path.is_relative_to(self.inside(self.root / item['search_root'])):
+                return None, ''
             if path.is_file() and path.stat().st_size == indexed['size'] and digest(path) == indexed.get('sha256'):
                 return path, '索引及 SHA-256 校验通过'
         if indexed:
             return None, ''  # A known changed/corrupt remote/local file must not fall back to name matching.
+        if item['kind'] == 'attachment':
+            # code/ may contain an edited answer with the same name and size.
+            # Only a validated attachment index can identify an original there.
+            return None, ''
         if item.get('ambiguous'):
             return None, ''
         search_root = self.inside(self.root / item['search_root'])
@@ -240,10 +307,13 @@ class Manager:
     def add_file(self, course, metadata, target, search_root, kind='file', assignment_id=None, ambiguous=False):
         name = safe_name(metadata.get('display_name') or metadata.get('filename') or f"file-{metadata['id']}")
         item = dict(key=f"{course['id']}:{kind}:{assignment_id or 0}:{metadata['id']}", kind=kind,
-                    course_id=course['id'], course=course['name'], file_id=metadata['id'], name=name,
+                    course_id=course['id'], course=course['name'], file_id=metadata['id'], assignment_id=assignment_id, name=name,
                     identity=self.identity(course['id'], metadata['id']), size=metadata.get('size') or 0,
                     updated_at=metadata.get('updated_at'), path=str(target / name),
                     search_root=str(search_root), status='pending', reason='', ambiguous=ambiguous)
+        item['source_identity'] = item['identity']
+        if kind == 'attachment':
+            item['identity'] += f'|assignment:{assignment_id}'
         # Paths in inventory are relative; signed source URLs are deliberately excluded.
         item['path'] = str(self.inside(target / name).relative_to(self.root))
         item['search_root'] = str(self.inside(search_root).relative_to(self.root))
@@ -349,22 +419,29 @@ class Manager:
                             'description.html': assignment.get('description') or '<p>无作业描述</p>',
                             'README.md': f"# {assignment['name']}\n\n截止（上海）：{due or '无'}\n\n提交状态：{state}\n\nCanvas：{assignment.get('html_url', '')}\n"}
                 pending = [name for name in contents if not (target / name).exists()]
-                self.items.append(dict(key=f"{course['id']}:assignment:{assignment['id']}", kind='assignment', course_id=course['id'],
+                assignment_item=dict(key=f"{course['id']}:assignment:{assignment['id']}", kind='assignment', course_id=course['id'],
                                        course=course['name'], name=assignment['name'], assignment_id=assignment['id'],
                                        path=str(self.inside(target).relative_to(self.root)), size=0, due_at=assignment.get('due_at'),
                                        canvas_url=f"{self.client.base}/courses/{course['id']}/assignments/{assignment['id']}",
                                        due_local=due.strftime('%Y-%m-%d %H:%M') if due else '无截止时间', submission=state,
-                                       status='pending' if pending else 'exists', reason='已有快照保留；提交状态来自本次扫描', _contents=contents))
+                                       status='pending' if pending else 'exists', reason='已有快照保留；提交状态来自本次扫描', _contents=contents)
+                self.items.append(assignment_item)
+                attachments=[]
                 parser = AttachmentParser(self.client.base)
                 parser.feed(assignment.get('description') or '')
                 for file_id in sorted(parser.ids):
                     try:
                         metadata = by_id.get(file_id) or self.client.get(f'/api/v1/files/{file_id}')
                         attachment_name = safe_name(metadata.get('display_name') or metadata.get('filename') or f'file-{file_id}')
-                        self.add_file(course, metadata, target / self.layout['attachments'], course_dir, 'attachment', assignment['id'],
+                        self.add_file(course, metadata, target / self.layout['code'], target / self.layout['code'], 'attachment', assignment['id'],
                                       ambiguous=name_counts.get(attachment_name.casefold(), 0)>1)
+                        attachments.append(self.items[-1])
                     except ManagerError as error:
                         self.errors.append(dict(course_id=course['id'], section=f'attachment:{file_id}', error=str(error)))
+                if attachments:
+                    assignment_item['reason'] += f"；下载时一并处理 {len(attachments)} 个附件到 {self.layout['code']}/"
+                    if any(item['status']=='pending' for item in attachments):
+                        assignment_item['status']='pending'
         progress(stage='scan', current=len(self.courses), total=len(self.courses), message='扫描完成')
         return self.inventory()
 
@@ -384,21 +461,41 @@ class Manager:
         finally:
             Path(tmp).unlink(missing_ok=True)
 
+    def local_attachment_source(self, item):
+        """Reuse a verified local original while giving each assignment its own copy."""
+        if item['kind'] != 'attachment':
+            return None
+        source=item['source_identity']
+        for identity,record in self.index.items():
+            if identity != source and not identity.startswith(source+'|assignment:'):
+                continue
+            if record.get('updated_at') != item.get('updated_at') or record.get('size') != item['size']:
+                continue
+            path=self.inside(self.root/record['path'])
+            if path.is_file() and path.stat().st_size==item['size'] and digest(path)==record.get('sha256'):
+                return path
+        # Historical, unindexed course files retain the existing name+size policy.
+        for candidate in self.items:
+            if candidate['kind']=='file' and candidate['identity']==source and candidate['status']=='exists' and source not in self.index:
+                path=self.inside(self.root/candidate['path'])
+                if path.is_file() and path.stat().st_size==item['size']:
+                    return path
+        return None
+
     def download_selected(self, keys, progress=lambda **kw: None):
         by_key = {i['key']: i for i in self.items}
         if not keys or any(key not in by_key for key in keys):
             raise ManagerError('请选择本次扫描中的有效项目')
-        selected = [by_key[key] for key in dict.fromkeys(keys)]
+        expanded=list(dict.fromkeys(keys))
+        parents={(by_key[key]['course_id'],by_key[key]['assignment_id']) for key in expanded if by_key[key]['kind']=='assignment'}
+        for item in self.items:
+            if item['kind']=='attachment' and (item['course_id'],item.get('assignment_id')) in parents and item['key'] not in expanded:
+                expanded.append(item['key'])
+        selected = [by_key[key] for key in expanded]
         # Protect the index against two independent CLI/UI processes downloading together.
         lock = self.inside(self.root / '.canvas-state' / 'download.lock')
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            raise ManagerError('另一个下载任务正在运行；若异常退出，请确认无进程后移除 download.lock') from None
         results = []
-        try:
-            os.close(fd)
+        with DownloadLock(lock):
             if self.index_path.exists():
                 self.index = json.loads(self.index_path.read_text(encoding='utf-8'))
             for number, item in enumerate(selected):
@@ -429,21 +526,27 @@ class Manager:
                             if path.exists():
                                 stamp = hashlib.sha256(str(item.get('updated_at')).encode()).hexdigest()[:8]
                                 path = path.with_name(f'{path.stem}__canvas-{item["file_id"]}-{stamp}{path.suffix}')
-                            self.client.download(item['file_id'], path, item['size'],
-                                                 lambda count: progress(bytes=count, size=item['size']), item.get('updated_at'))
+                            local_source=self.local_attachment_source(item)
+                            if local_source:
+                                with local_source.open('rb') as stream:
+                                    atomic_new(path,iter(lambda:stream.read(128*1024),b''),item['size'],
+                                               lambda count:progress(bytes=count,size=item['size']))
+                                result['reason']='复用本地已下载文件，保存附件副本到作业代码目录'
+                            else:
+                                self.client.download(item['file_id'], path, item['size'],
+                                                     lambda count: progress(bytes=count, size=item['size']), item.get('updated_at'))
                             self.index[item['identity']] = dict(path=str(path.relative_to(self.root)), size=path.stat().st_size,
                                                                updated_at=item.get('updated_at'), sha256=digest(path))
                             self.save_index()
                             result.update(status='downloaded', path=str(path.relative_to(self.root)))
                     item['status'] = 'exists' if result['status'] in ('exists', 'downloaded') else item['status']
                     item['path'] = result['path']
-                except (ManagerError, OSError, ValueError) as error:
-                    # Filesystem errors may contain paths, but never remote signed URLs.
-                    result.update(status='failed', reason=str(error) if isinstance(error, ManagerError) else f'本地文件处理失败（{type(error).__name__}）')
+                except Exception as error:
+                    # Isolate a failed file, including unexpected transport errors,
+                    # so the remaining queue proceeds. Never expose signed URLs.
+                    result.update(status='failed', reason=str(error) if isinstance(error, ManagerError) else f'文件处理失败（{type(error).__name__}）')
                 results.append(result)
                 progress(current=number + 1, results=list(results))
-        finally:
-            lock.unlink(missing_ok=True)
         return results
 
 

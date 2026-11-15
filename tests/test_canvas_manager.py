@@ -1,5 +1,6 @@
 """Offline behavioral regression tests; run with Python -B -m unittest discover."""
 import json
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -120,12 +121,58 @@ class ManagerTests(unittest.TestCase):
     def test_assignment_snapshot_preserves_user_files_and_attachments_deduplicate(self):
         self.manager.scan()
         result = self.manager.download_selected(['1:assignment:21', '1:file:0:11', '1:attachment:21:11'])
-        self.assertEqual([r['status'] for r in result], ['downloaded', 'downloaded', 'exists'])
+        self.assertEqual([r['status'] for r in result], ['downloaded', 'downloaded', 'downloaded'])
+        self.assertEqual(sum(call==('download',11) for call in self.api.calls),1)
         snapshot = self.root / result[0]['path'] / 'README.md'
         snapshot.write_text('my notes', encoding='utf-8')
         self.manager.download_selected(['1:assignment:21'])
         self.assertEqual(snapshot.read_text(encoding='utf-8'), 'my notes')
         self.assertTrue(snapshot.with_name('code').is_dir())
+
+    def test_assignment_selection_also_downloads_attachments_into_its_code_folder(self):
+        self.manager.scan()
+        results=self.manager.download_selected(['1:assignment:21'])
+        self.assertEqual([r['key'] for r in results],['1:assignment:21','1:attachment:21:11'])
+        attachment=self.root/results[1]['path']
+        self.assertEqual(attachment.parent,self.root/results[0]['path']/'code')
+        self.assertEqual(attachment.read_bytes(),b'data')
+
+    def test_attachment_reuses_course_download_but_is_present_in_code(self):
+        self.manager.scan()
+        slides=self.manager.download_selected(['1:file:0:11'])[0]
+        results=self.manager.download_selected(['1:assignment:21'])
+        self.assertEqual((self.root/results[1]['path']).read_bytes(),b'data')
+        self.assertNotEqual(slides['path'],results[1]['path'])
+        self.assertEqual(sum(call==('download',11) for call in self.api.calls),1)
+        restarted=M.Manager(self.api,self.root)
+        restarted.scan()
+        attachment=next(i for i in restarted.items if i['key']=='1:attachment:21:11')
+        self.assertEqual(attachment['status'],'exists')
+        self.assertEqual(Path(attachment['path']).parent.name,'code')
+
+    def test_same_attachment_is_available_in_each_assignment_code_folder(self):
+        self.api.assignments.append({**self.api.assignments[0],'id':22,'name':'作业二'})
+        self.manager.scan()
+        results=self.manager.download_selected(['1:assignment:21','1:assignment:22'])
+        attachments=[r for r in results if ':attachment:' in r['key']]
+        self.assertEqual(len(attachments),2)
+        self.assertNotEqual(attachments[0]['path'],attachments[1]['path'])
+        for result in attachments:
+            self.assertEqual((self.root/result['path']).read_bytes(),b'data')
+            self.assertEqual(Path(result['path']).parent.name,'code')
+        self.assertEqual(sum(call==('download',11) for call in self.api.calls),1)
+
+    def test_attachment_does_not_overwrite_or_mistake_user_code_for_original(self):
+        self.manager.scan()
+        assignment=next(i for i in self.manager.items if i['kind']=='assignment')
+        user_file=self.root/assignment['path']/'code/Lecture 2.pdf'
+        user_file.parent.mkdir(parents=True)
+        user_file.write_bytes(b'mine')
+        self.manager.scan()
+        results=self.manager.download_selected(['1:assignment:21'])
+        self.assertEqual(user_file.read_bytes(),b'mine')
+        self.assertNotEqual(self.root/results[1]['path'],user_file)
+        self.assertEqual((self.root/results[1]['path']).read_bytes(),b'data')
 
     def test_unknown_submissions_and_course_permission_failure_are_explicit(self):
         self.api.assignments[0]['submission'] = None
@@ -164,11 +211,102 @@ class ManagerTests(unittest.TestCase):
         with self.assertRaises(M.ManagerError):
             self.manager.download_selected(['invalid'])
         lock = self.root / '.canvas-state/download.lock'
-        lock.parent.mkdir()
-        lock.write_text('other task')
-        with self.assertRaises(M.ManagerError):
-            self.manager.download_selected(['1:file:0:11'])
-        self.assertEqual(lock.read_text(), 'other task')
+        with M.DownloadLock(lock):
+            before=lock.read_bytes()
+            with self.assertRaises(M.ManagerError):
+                self.manager.download_selected(['1:file:0:11'])
+            self.assertEqual(lock.read_bytes(),before)
+
+    def test_orphaned_empty_lock_does_not_block_the_next_download(self):
+        self.manager.scan()
+        marker=self.root/'.canvas-state/download.lock'
+        marker.parent.mkdir()
+        marker.touch()
+        results=self.manager.download_selected(['1:file:0:11'])
+        self.assertEqual(results[0]['status'],'downloaded')
+        self.assertFalse(marker.exists())
+
+    def test_failed_file_does_not_block_later_items_or_next_job(self):
+        self.manager.scan()
+        original=self.api.download
+        def fails_first(file_id,*args):
+            if file_id==11:
+                raise RuntimeError('unexpected transport failure with private URL')
+            return original(file_id,*args)
+        self.api.download=fails_first
+        results=self.manager.download_selected(['1:file:0:11','1:file:0:12'])
+        self.assertEqual([r['status'] for r in results],['failed','downloaded'])
+        self.assertNotIn('private URL',results[0]['reason'])
+        self.api.download=original
+        self.assertEqual(self.manager.download_selected(['1:file:0:11'])[0]['status'],'downloaded')
+
+    def test_live_download_blocks_other_instance_without_replacing_its_marker(self):
+        self.manager.scan()
+        contender=M.Manager(self.api,self.root)
+        contender.scan()
+        blocked=[]
+        original=self.api.download
+        def during_download(file_id,*args):
+            marker=self.root/'.canvas-state/download.lock'
+            before=marker.read_bytes()
+            with self.assertRaises(M.ManagerError):
+                contender.download_selected(['1:file:0:12'])
+            self.assertEqual(marker.read_bytes(),before)
+            blocked.append(True)
+            return original(file_id,*args)
+        self.api.download=during_download
+        self.assertEqual(self.manager.download_selected(['1:file:0:11'])[0]['status'],'downloaded')
+        self.assertEqual(blocked,[True])
+        self.api.download=original
+        self.assertEqual(contender.download_selected(['1:file:0:12'])[0]['status'],'downloaded')
+
+    def test_process_death_releases_lock_without_finally(self):
+        scripts=str(Path(M.__file__).parent)
+        code=("import os,sys; sys.path.insert(0,sys.argv[1]); import canvas_manager as M; "
+              "lease=M.DownloadLock(M.Path(sys.argv[2])); lease.__enter__(); os._exit(0)")
+        marker=self.root/'.canvas-state/download.lock'
+        child=subprocess.run([sys.executable,'-B','-c',code,scripts,str(marker)],capture_output=True,timeout=10)
+        self.assertEqual(child.returncode,0,child.stderr.decode(errors='replace'))
+        self.assertTrue(marker.exists())
+        self.manager.scan()
+        self.assertEqual(self.manager.download_selected(['1:file:0:11'])[0]['status'],'downloaded')
+
+    def test_live_other_process_is_protected_and_force_exit_allows_retry(self):
+        marker=self.root/'.canvas-state/download.lock'
+        ready=self.root/'ready'
+        code=("import sys,time; sys.path.insert(0,sys.argv[1]); import canvas_manager as M; "
+              "lease=M.DownloadLock(M.Path(sys.argv[2])); lease.__enter__(); "
+              "M.Path(sys.argv[3]).write_text('ready'); sys.stdin.buffer.read(1)")
+        child=subprocess.Popen([sys.executable,'-B','-c',code,str(Path(M.__file__).parent),str(marker),str(ready)],
+                               stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        try:
+            deadline=time.monotonic()+5
+            while not ready.exists() and child.poll() is None and time.monotonic()<deadline:
+                time.sleep(.01)
+            self.assertTrue(ready.exists(),'Child failed to acquire the lock')
+            self.manager.scan()
+            before=marker.read_bytes()
+            with self.assertRaises(M.ManagerError):
+                self.manager.download_selected(['1:file:0:11'])
+            self.assertEqual(marker.read_bytes(),before)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=5)
+        self.assertEqual(self.manager.download_selected(['1:file:0:11'])[0]['status'],'downloaded')
+
+    def test_queued_task_after_fatal_index_error_is_not_left_busy_or_locked(self):
+        self.manager.scan()
+        app=M.Application(self.manager)
+        app.manager.index_path.parent.mkdir()
+        app.manager.index_path.write_text('{bad',encoding='utf-8')
+        app.start('download',['1:file:0:11'])
+        self.wait_task(app)
+        self.assertFalse((self.root/'.canvas-state/download.lock').exists())
+        app.manager.index_path.unlink()
+        app.start('download',['1:file:0:12'])
+        self.wait_task(app)
+        self.assertEqual(app.state['results'][0]['status'],'downloaded')
 
     def test_identical_assignment_titles_get_separate_snapshots(self):
         self.api.assignments.append({**self.api.assignments[0], 'id':22})
@@ -176,7 +314,7 @@ class ManagerTests(unittest.TestCase):
         assignments = [i for i in report['items'] if i['kind'] == 'assignment']
         self.assertNotEqual(assignments[0]['path'], assignments[1]['path'])
         results = self.manager.download_selected([i['key'] for i in assignments])
-        self.assertEqual([r['status'] for r in results], ['downloaded', 'downloaded'])
+        self.assertEqual([r['status'] for r in results if ':assignment:' in r['key']], ['downloaded', 'downloaded'])
         restarted = M.Manager(self.api, self.root)
         paths = [i['path'] for i in restarted.scan()['items'] if i['kind']=='assignment']
         self.assertEqual(paths, [i['path'] for i in assignments])

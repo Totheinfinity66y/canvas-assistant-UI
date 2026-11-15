@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.1.1
+
+- Download assignment attachments together with the assignment into its code folder, reusing local originals without overwriting student work.
+- Keep legacy attachment folders untouched and give every assignment its own indexed attachment copies.
+- Recover orphaned download markers automatically using an OS-held mutex that is released even when the process is terminated.
+- Keep concurrent downloads from separate processes protected; never remove the persistent guard file.
+- Record unexpected per-file failures without blocking later queue items or retries.
+- Add regression coverage for empty legacy markers, failed files, live contention, abrupt process exit and queue restart after an index error.
+
 ## v2.1.0
 
 - Add the provided Canvas account-settings screenshot to the setup wizard and documentation.

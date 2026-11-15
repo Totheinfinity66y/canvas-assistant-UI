@@ -107,7 +107,20 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(Path(assignment['path']),Path('机器学习/练习/作业一'))
         results=manager.download_selected([file['key'],assignment['key']])
         self.assertTrue((self.root/results[1]['path']/'答案').is_dir())
-        self.assertEqual([r['status'] for r in results],['downloaded','downloaded'])
+        self.assertEqual([r['status'] for r in results],['downloaded','downloaded','downloaded'])
+        self.assertEqual(Path(results[2]['path']).parent.name,'答案')
+
+    def test_legacy_attachment_setting_is_an_alias_of_code_without_moving_files(self):
+        settings=self.settings(layout={'attachments':'旧附件','code':'code'})
+        self.assertEqual(settings['layout']['attachments'],'code')
+        old=self.root/'机器学习/homework/2026-10-02_作业一/旧附件/Lecture 2.pdf'
+        old.parent.mkdir(parents=True)
+        old.write_bytes(b'data')
+        manager=M.Manager(FakeCanvas(),self.root,layout={'attachments':'旧附件','code':'code'})
+        manager.scan()
+        results=manager.download_selected(['1:assignment:21'])
+        self.assertEqual(old.read_bytes(),b'data')
+        self.assertEqual(Path(results[1]['path']).parent.name,'code')
 
     def test_selected_courses_filter_remote_inventory(self):
         manager=M.Manager(FakeCanvas(),self.root,course_ids=['999'])

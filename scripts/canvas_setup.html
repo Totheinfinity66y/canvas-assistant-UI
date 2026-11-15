@@ -19,7 +19,7 @@
 </div></main>
 <script>
 const $=id=>document.getElementById(id),csrf='__CSRF__';let step=0,settings={},testedCourses=[],working=false;
-const layoutNames={slides:'课件目录',homework:'作业目录',project:'项目资料目录（课件下）',reference:'参考资料目录（课件下）',attachments:'作业附件目录',code:'作答代码目录',week_prefix:'教学周目录前缀'};
+const layoutNames={slides:'课件目录',homework:'作业目录',project:'项目资料目录（课件下）',reference:'参考资料目录（课件下）',code:'作业代码与附件目录（默认 code）',week_prefix:'教学周目录前缀'};
 for(const [key,label]of Object.entries(layoutNames)){const wrap=document.createElement('div'),l=document.createElement('label');l.htmlFor='layout_'+key;l.textContent=label;const input=document.createElement('input');input.id='layout_'+key;wrap.append(l,input);$('layoutFields').append(wrap)}
 async function request(action,data){let response=await fetch('/api/setup/'+action,{method:'POST',headers:{'Content-Type':'application/json','X-Canvas-CSRF':csrf},body:JSON.stringify(data)});let value=await response.json();if(!response.ok)throw Error(value.error);return value}
 function account(){return {profile:$('profile').value,base_url:$('base').value,token:$('token').value}}

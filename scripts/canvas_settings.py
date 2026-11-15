@@ -13,7 +13,7 @@ class SettingsError(Exception):
 
 
 LAYOUT = dict(slides='slides', homework='homework', project='project', reference='reference',
-              attachments='attachments', code='code', week_prefix='Week_', date_assignments=True)
+              attachments='code', code='code', week_prefix='Week_', date_assignments=True)
 LABELS = dict(app_title='Canvas 学习助手', assignments_title='作业进度', files_title='资料下载')
 
 
@@ -50,13 +50,16 @@ def normalize_settings(raw):
     if not isinstance(raw.get('layout', {}), dict) or not isinstance(raw.get('labels', {}), dict):
         raise SettingsError('目录和页面命名设置必须为对象')
     layout.update({k:v for k,v in raw.get('layout', {}).items() if k in LAYOUT})
+    # Legacy settings may name a separate attachments folder. New downloads
+    # always share the code folder; existing files are never migrated here.
+    layout['attachments'] = layout['code']
     for key in LAYOUT:
         if key != 'date_assignments':
             component(layout[key])
     if not isinstance(layout['date_assignments'], bool):
         raise SettingsError('作业日期设置必须为布尔值')
     # These pairs share a parent; equal names would mix different material types.
-    for group in [('slides','homework'), ('project','reference'), ('attachments','code')]:
+    for group in [('slides','homework'), ('project','reference')]:
         if len({layout[k].casefold() for k in group}) != len(group):
             raise SettingsError('同层级的分类目录不能重名')
     labels = dict(LABELS)
